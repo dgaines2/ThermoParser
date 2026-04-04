@@ -22,6 +22,8 @@ array dimensions and the data source.
 #        from the phonopy or sumo band.yaml.
 #    phonopy_dos:
 #        from the phonopy projected_dos.dat.
+#    shengbte:
+#        from a ShengBTE/FourPhonon calculation directory.
 #
 #    get_path:
 #        gets high path from phonopy dispersion data.
@@ -731,6 +733,417 @@ def phono3py(filename, quantities='all'):
         data['occupation'] = tp.calculate.be_occupation(data['frequency'],
                                                         data['temperature'],
                                                         use_tprc=False)
+
+    for c in conversions:
+        if c in data:
+            data[c] = np.multiply(data[c], float(conversions[c]))
+
+    return data
+
+def shengbte(directory, quantities='all'):
+    """Loads ShengBTE/FourPhonon data from a calculation directory.
+
+    Reads text-file outputs from ShengBTE and its FourPhonon extension.
+    Converts scattering rates to gamma (imaginary self-energy) for
+    compatibility with tp plotting functions. Can also calculate
+    lifetimes, mean free paths, occupations, and mode-resolved thermal
+    conductivity. Includes unit conversions and outputs units and index
+    order for all data (see tp.settings).
+
+    The mode_kappa quantity is synthesised from the RTA kinetic theory
+    expression: kappa_ij = (1/NV) * C * v_i * v_j * tau, where C is the
+    per-mode specific heat from the Bose-Einstein distribution. This is
+    exact for RTA but approximate for the iterative BTE solution.
+
+    Optionally loads pre-computed cumulative kappa vs MFP and vs
+    frequency as ``cumulative_kappa_mfp`` and
+    ``cumulative_kappa_frequency``.
+
+    If FourPhonon outputs are present (BTE.w_3ph, BTE.w_4ph), they can
+    be loaded as gamma_3ph and gamma_4ph.
+
+    Arguments
+    ---------
+
+        directory : str
+            path to the ShengBTE calculation directory containing
+            CONTROL, BTE.* files and T*K/ subdirectories.
+
+        quantities : str or list, optional
+            values to extract. Accepts tp names, abbreviations or 'all'.
+            'all' loads all available quantities except gamma_3ph,
+            gamma_4ph, cumulative_kappa_mfp and cumulative_kappa_frequency
+            which must be requested explicitly. Default: all.
+
+    Returns
+    -------
+
+        dict
+            extracted values.
+    """
+
+    import math
+    import os
+    from pathlib import Path
+    from scipy.constants import physical_constants
+
+    import f90nml
+
+    # name conversions and abbreviations
+
+    sconversions = settings.shengbte_conversions()
+    conversions = settings.conversions()
+    tnames = settings.to_tp()
+    units = settings.units()
+    dims = settings.dimensions()
+    if isinstance(quantities, str): quantities = quantities.split()
+    quantities = [tnames[q] if q in tnames else q for q in quantities]
+    subs = {'dispersion': ['qpoint'],
+            'waterfall':  ['frequency'],
+            'wideband':   ['frequency', 'gamma', 'qpoint']}
+
+    # quantities derived from those in the file
+    derived = {'gamma':           [],
+               'gamma_3ph':       [],
+               'gamma_4ph':       [],
+               'lifetime':        ['gamma'],
+               'mean_free_path':  ['gamma', 'group_velocity'],
+               'mode_kappa':      ['gamma', 'group_velocity', 'frequency'],
+               'occupation':      ['frequency']}
+
+    for i in range(len(quantities)):
+        while True:
+            if quantities[i] in subs:
+                quantities.extend(subs[quantities[i]])
+                del quantities[i]
+            else:
+                break
+
+    for q in derived:
+        if q in quantities:
+            for q2 in derived[q]:
+                if q2 not in quantities:
+                    quantities.append(q2)
+
+    quantities = list(np.ravel(quantities))
+
+    # add dependent variables
+
+    for d in ['temperature', 'qpoint']:
+        if d not in quantities:
+            for q in quantities:
+                if q in tnames:
+                    q = tnames[q]
+                if q in dims and d in dims[q]:
+                    quantities.append(d)
+                    break
+
+    # parse CONTROL file
+
+    directory = Path(directory).resolve()
+    control_path = directory / 'CONTROL'
+    raw_control = f90nml.read(control_path).todict()
+    control = {}
+    for section in raw_control.values():
+        control.update(section)
+    control.pop('_start_index', None)
+
+    natoms = control['natoms']
+    nbands = natoms * 3
+    ngrid = np.array(control['ngrid'], dtype=int)
+    N = np.prod(ngrid)
+
+    lfactor = control.get('lfactor', 1.0)
+    lattvec = np.array(control['lattvec'], dtype=float) * lfactor
+    volume = np.abs(np.linalg.det(lattvec))
+
+    if 't' in control:
+        temperatures = np.array([control['t']], dtype=float)
+    else:
+        t_min = control['t_min']
+        t_max = control['t_max']
+        t_step = control['t_step']
+        temperatures = np.arange(t_min, t_max + 1, t_step, dtype=float)
+
+    # discover temperature directories
+
+    temperature_dirs = sorted(
+        [p for p in directory.glob('T*K') if p.is_dir()],
+        key=lambda d: int(d.name.strip('TK')))
+
+    # determine available quantities
+
+    available = ['temperature', 'qpoint', 'frequency', 'group_velocity',
+                 'gruneisen', 'gamma', 'lattice_thermal_conductivity',
+                 'lifetime', 'mean_free_path', 'occupation', 'mode_kappa']
+    has_3ph = any((td / 'BTE.w_3ph').exists() for td in temperature_dirs)
+    has_4ph = any((td / 'BTE.w_4ph').exists() for td in temperature_dirs)
+    if has_3ph:
+        available.append('gamma_3ph')
+    if has_4ph:
+        available.append('gamma_4ph')
+    available.extend(['cumulative_kappa_mfp', 'cumulative_kappa_frequency'])
+
+    if 'all' in quantities:
+        quantities = ['temperature', 'qpoint', 'frequency', 'group_velocity',
+                      'gruneisen', 'gamma', 'lattice_thermal_conductivity',
+                      'lifetime', 'mean_free_path', 'occupation', 'mode_kappa']
+
+    # initialise data
+
+    data = {'meta': {'kappa_source': 'shengbte',
+                     'units':        {},
+                     'dimensions':   {}}}
+
+    # read temperature-independent data
+
+    if 'frequency' in quantities or any(
+            q in quantities for q in ['mode_kappa', 'occupation']):
+        omega = np.loadtxt(directory / 'BTE.omega')
+        nq = omega.shape[0]
+        data['frequency'] = omega * sconversions['frequency']
+
+    if 'qpoint' in quantities:
+        qpoints_file = np.loadtxt(directory / 'BTE.qpoints')
+        data['qpoint'] = qpoints_file[:, 3:]
+        if 'frequency' not in data:
+            nq = data['qpoint'].shape[0]
+
+    if 'group_velocity' in quantities or any(
+            q in quantities for q in ['mean_free_path', 'mode_kappa']):
+        gv_raw = np.loadtxt(directory / 'BTE.v')
+        data['group_velocity'] = gv_raw.reshape(
+            (nq, nbands, 3), order='F') * sconversions['group_velocity']
+
+    if 'gruneisen' in quantities:
+        grun_path = directory / 'BTE.gruneisen'
+        if grun_path.exists():
+            data['gruneisen'] = np.loadtxt(grun_path)
+
+    # read temperature-dependent data
+
+    rates_list = []
+    rates3_list = []
+    rates4_list = []
+    kappa_list = []
+    ck_mfp_list = []
+    ck_freq_list = []
+
+    need_rates = any(q in quantities for q in [
+        'gamma', 'lifetime', 'mean_free_path', 'mode_kappa'])
+    need_3ph = 'gamma_3ph' in quantities
+    need_4ph = 'gamma_4ph' in quantities
+    need_kappa = 'lattice_thermal_conductivity' in quantities
+    need_ck_mfp = 'cumulative_kappa_mfp' in quantities
+    need_ck_freq = 'cumulative_kappa_frequency' in quantities
+
+    raw_rates_list = []
+
+    for td in temperature_dirs:
+        if need_rates:
+            w_rta = td / 'BTE.w'
+            if w_rta.exists():
+                rates_raw = np.loadtxt(w_rta, usecols=1)
+            else:
+                raise FileNotFoundError(
+                    'No BTE.w in {}'.format(td))
+            rates = rates_raw.reshape((nq, nbands), order='F')
+            rates = np.nan_to_num(rates, nan=0.0)
+            rates_list.append(rates)
+
+        if need_3ph:
+            w3_path = td / 'BTE.w_3ph'
+            if w3_path.exists():
+                r3 = np.loadtxt(w3_path, usecols=1)
+                r3 = r3.reshape((nq, nbands), order='F')
+                r3 = np.nan_to_num(r3, nan=0.0)
+                rates3_list.append(r3)
+
+        if need_4ph:
+            w4_path = td / 'BTE.w_4ph'
+            if w4_path.exists():
+                r4 = np.loadtxt(w4_path, usecols=1)
+                r4 = r4.reshape((nq, nbands), order='F')
+                r4 = np.nan_to_num(r4, nan=0.0)
+                rates4_list.append(r4)
+
+        if need_kappa:
+            kt_file = np.loadtxt(td / 'BTE.kappa_tensor')
+            kt = kt_file[-1, 1:].reshape((3, 3))
+            kappa_list.append(kt)
+
+        if need_ck_mfp:
+            ck_path = td / 'BTE.cumulative_kappa_tensor'
+            if ck_path.exists():
+                ck_raw = np.loadtxt(ck_path)
+                ck_mfp_list.append({
+                    'mfp':   ck_raw[:, 0] * 1e-9,
+                    'kappa': ck_raw[:, 1:].reshape((-1, 3, 3))})
+
+        if need_ck_freq:
+            ckf_path = td / 'BTE.cumulative_kappaVsOmega_tensor'
+            if ckf_path.exists():
+                ckf_raw = np.loadtxt(ckf_path)
+                ck_freq_list.append({
+                    'frequency': ckf_raw[:, 0] * sconversions['frequency'],
+                    'kappa':     ckf_raw[:, 1:].reshape((-1, 3, 3))})
+
+    # stack temperature-dependent arrays
+
+    if rates_list:
+        rates_all = np.array(rates_list)  # (ntemps, nq, nbands) in ps^-1
+
+    if need_kappa and kappa_list:
+        data['lattice_thermal_conductivity'] = np.array(kappa_list)
+
+    # compute gamma (HWHM of spectral function) from RTA scattering rates
+    # ShengBTE RTA rate w = 1/tau in ps^-1
+    # gamma in THz: gamma = w / (4 * pi)
+    # This matches phono3py convention: tau = 1 / (4 * pi * gamma)
+
+    if any(q in quantities for q in ['gamma', 'lifetime', 'mean_free_path',
+                                      'mode_kappa']):
+        data['gamma'] = rates_all / (4.0 * math.pi)
+
+    if need_3ph and rates3_list:
+        data['gamma_3ph'] = np.array(rates3_list) / (4.0 * math.pi)
+
+    if need_4ph and rates4_list:
+        data['gamma_4ph'] = np.array(rates4_list) / (4.0 * math.pi)
+
+    # compute lifetime: tau = 1/rate, convert ps -> s
+
+    if 'lifetime' in quantities or 'mean_free_path' in quantities or \
+       'mode_kappa' in quantities:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            lifetime = np.reciprocal(rates_all) * 1e-12  # ps -> s
+        infmax = np.nanmax(np.where(np.isinf(lifetime), 0, lifetime))
+        lifetime = np.where(np.isinf(lifetime), infmax, lifetime)
+        lifetime = np.where(np.isnan(lifetime), np.nanmin(lifetime), lifetime)
+        if 'lifetime' in quantities:
+            data['lifetime'] = lifetime
+
+    # compute mean free path
+
+    if 'mean_free_path' in quantities:
+        data['mean_free_path'] = np.multiply(
+            lifetime[:, :, :, np.newaxis],
+            data['group_velocity'][np.newaxis, :, :, :])
+
+    # compute Bose-Einstein occupation
+
+    if 'occupation' in quantities:
+        data['occupation'] = tp.calculate.be_occupation(
+            data['frequency'], temperatures, use_tprc=False)
+
+    # compute mode-resolved kappa via RTA kinetic theory
+    # kappa_ij(T,q,nu) = (w_q/NV) * C(T,q,nu) * v_i(q,nu) * v_j(q,nu) * tau(T,q,nu)
+    # C = kB * x^2 * exp(x) / (exp(x) - 1)^2, x = hbar*omega/(kB*T)
+    # w_q = degeneracy of IBZ q-point (number of equivalent points in FBZ)
+    # V in m^3 (converted from nm^3 via *1e-27)
+
+    if 'mode_kappa' in quantities:
+        hbar = physical_constants['Planck constant over 2 pi'][0]  # J s
+        kb = physical_constants['Boltzmann constant'][0]  # J K-1
+
+        freq_hz = data['frequency'] * 1e12 * 2 * math.pi  # THz -> rad/s
+        gv = data['group_velocity']  # m/s, (nq, nbands, 3)
+        volume_m3 = volume * 1e-27  # nm^3 -> m^3
+
+        # q-point degeneracy from BTE.qpoints (column 2, 0-indexed)
+        qpoints_file = np.loadtxt(directory / 'BTE.qpoints')
+        degeneracy = qpoints_file[:, 2]  # (nq,)
+
+        mode_kappa_list = []
+        for ti, T in enumerate(temperatures):
+            if T == 0:
+                mk = np.zeros((nq, nbands, 6))
+            else:
+                x = hbar * freq_hz / (kb * T)  # (nq, nbands)
+                with np.errstate(over='ignore', divide='ignore',
+                                 invalid='ignore'):
+                    exp_x = np.exp(x)
+                    C = kb * x**2 * exp_x / (exp_x - 1)**2  # J/K per mode
+                C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
+                tau_t = lifetime[ti]  # (nq, nbands) in s
+
+                # outer product of velocities: v_i * v_j -> 6 Voigt components
+                # order: xx, yy, zz, yz, xz, xy
+                vv = np.zeros((nq, nbands, 6))
+                vv[:, :, 0] = gv[:, :, 0] * gv[:, :, 0]  # xx
+                vv[:, :, 1] = gv[:, :, 1] * gv[:, :, 1]  # yy
+                vv[:, :, 2] = gv[:, :, 2] * gv[:, :, 2]  # zz
+                vv[:, :, 3] = gv[:, :, 1] * gv[:, :, 2]  # yz
+                vv[:, :, 4] = gv[:, :, 0] * gv[:, :, 2]  # xz
+                vv[:, :, 5] = gv[:, :, 0] * gv[:, :, 1]  # xy
+
+                # prefactor includes degeneracy weight for IBZ -> FBZ
+                prefactor = (degeneracy[:, np.newaxis] * C * tau_t
+                             / (N * volume_m3))  # (nq, nbands)
+                mk = prefactor[:, :, np.newaxis] * vv  # (nq, nbands, 6)
+            mode_kappa_list.append(mk)
+
+        data['mode_kappa'] = np.array(mode_kappa_list)  # (ntemps, nq, nbands, 6)
+
+    # store temperature
+
+    if 'temperature' in quantities:
+        data['temperature'] = temperatures
+
+    # store cumulative kappa
+
+    if need_ck_mfp and ck_mfp_list:
+        data['cumulative_kappa_mfp'] = dict(zip(
+            [str(int(t)) for t in temperatures], ck_mfp_list))
+
+    if need_ck_freq and ck_freq_list:
+        data['cumulative_kappa_frequency'] = dict(zip(
+            [str(int(t)) for t in temperatures], ck_freq_list))
+
+    # convert 6-component Voigt to 3x3 tensors (same as phono3py loader)
+    # only applies to mode_kappa which was built in Voigt notation;
+    # lattice_thermal_conductivity is already (ntemps, 3, 3) from ShengBTE
+
+    if 'mode_kappa' in data:
+        q2 = 'mode_kappa'
+        for i, d in enumerate(dims[q2]):
+            if d == 6:
+                data[q2] = np.moveaxis(data[q2], i, 0)
+                data[q2] = [[data[q2][0], data[q2][5], data[q2][4]],
+                            [data[q2][5], data[q2][1], data[q2][3]],
+                            [data[q2][4], data[q2][3], data[q2][2]]]
+                data[q2] = np.moveaxis(data[q2], 0, i+1)
+                data[q2] = np.moveaxis(data[q2], 0, i+1)
+                dims[q2][i] = 3
+                dims[q2].insert(i, 3)
+                break
+
+    # lattice_thermal_conductivity is already (ntemps, 3, 3); update dims
+    if 'lattice_thermal_conductivity' in data:
+        dims['lattice_thermal_conductivity'] = ['temperature', 3, 3]
+
+    # populate meta
+
+    for q2 in data:
+        if q2 == 'meta':
+            continue
+        if q2 in units:
+            data['meta']['units'][q2] = units[q2]
+        if q2 in dims:
+            data['meta']['dimensions'][q2] = dims[q2]
+
+    # add units/dimensions for FourPhonon-specific quantities
+
+    if 'gamma_3ph' in data:
+        data['meta']['units']['gamma_3ph'] = 'THz'
+        data['meta']['dimensions']['gamma_3ph'] = ['temperature', 'qpoint',
+                                                    'band']
+    if 'gamma_4ph' in data:
+        data['meta']['units']['gamma_4ph'] = 'THz'
+        data['meta']['dimensions']['gamma_4ph'] = ['temperature', 'qpoint',
+                                                    'band']
+
+    # apply custom conversions from tprc.yaml
 
     for c in conversions:
         if c in data:

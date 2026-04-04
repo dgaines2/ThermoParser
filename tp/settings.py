@@ -99,6 +99,7 @@ def __dir__():
             'boltztrap_conversions',
             'phonopy_conversions',
             'phono3py_conversions',
+            'shengbte_conversions',
             'units',
             'dimensions',
             'boltztrap_dimensions',
@@ -305,6 +306,15 @@ def phono3py_conversions():
                    'heat_capacity':  1.60218e-19, # eV K-1 to J K-1
                    'lifetime':       1e-12,       # THz-1 to s
                    'mean_free_path': 1e-10}       # AA to m
+
+    return conversions
+
+def shengbte_conversions():
+    """Get dictionary of unit conversions for shengbte to tp."""
+
+    import math
+    conversions = {'frequency':      1.0 / (2.0 * math.pi), # rad ps-1 to THz
+                   'group_velocity': 1e3}                    # km s-1 to m s-1
 
     return conversions
 
